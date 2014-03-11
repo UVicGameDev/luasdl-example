@@ -2,6 +2,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include <string.h>
 #include <stdio.h>
 
 SDL_Window *gWindow;
@@ -41,8 +42,8 @@ int main(int argc, char *argv[])
     // initialize player position/texture coordinate information
     SDL_Rect playerSrcRect = { 0, 0, 16, 16 };
     SDL_Rect playerDstRect = { 0, 0, 64, 64 };
-    float playerX = 0.0f;
-    float playerY = 0.0f;
+    double playerX = 0.0f;
+    double playerY = 0.0f;
 
     typedef enum PlayerDirection
     {
@@ -167,8 +168,8 @@ int main(int argc, char *argv[])
         lua_pop(L, 1);
 
         // adjust animation to position
-        playerDstRect.x = playerX;
-        playerDstRect.y = playerY;
+        playerDstRect.x = (int) playerX;
+        playerDstRect.y = (int) playerY;
 
         // adjust animation to direction
         playerSrcRect.y = playerDirection * 16;
