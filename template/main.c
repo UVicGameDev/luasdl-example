@@ -1,81 +1,65 @@
 #include <SDL.h>
-
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
 #include <stdio.h>
+
+SDL_Window *gWindow;
+SDL_Renderer *gRenderer;
+
+SDL_Texture * LoadTexture(const char *spriteSheetPath);
 
 int main(int argc, char *argv[])
 {
     // initialize SDL
-    if (SDL_Init(SDL_INIT_EVERYTHING)) {
+    if (SDL_Init(SDL_INIT_VIDEO)) {
         printf("SDL_Init: %s\n", SDL_GetError());
         return -1;
     }
 
-    // create the window
-    SDL_Window *window = SDL_CreateWindow(
-                            "Template",
-                            SDL_WINDOWPOS_UNDEFINED,
-                            SDL_WINDOWPOS_UNDEFINED,
-                            640, 480,
-                            0);
-    if (!window) {
-        printf("SDL_CreateWindow: %s\n", SDL_GetError());
+    // Create window and renderer
+    if (SDL_CreateWindowAndRenderer(640, 480, 0, &gWindow, &gRenderer)) {
+        printf("SDL_CreateWindowAndRenderer: %s\n", SDL_GetError());
         return -1;
     }
 
-    // create a renderer for the window
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, 0);
-    if (!renderer) {
-        printf("SDL_CreateRenderer: %s\n", SDL_GetError());
+    // Initialize lua and read the script
+    lua_State *L = luaL_newstate();
+    luaL_openlibs(L);
+    if (luaL_dofile(L, "game.lua")) {
+        printf("Failed to load game.lua: %s\n", lua_tostring(L, -1));
         return -1;
     }
 
-    // load the mario image
-    SDL_Surface *marioSurface = SDL_LoadBMP("mario.bmp");
-    if (!marioSurface) {
-        printf("SDL_LoadBMP: %s\n", SDL_GetError());
+    // load texture for the player
+    SDL_Texture *playerTexture = LoadTexture("player.bmp");
+    if (!playerTexture) {
+        printf("LoadTexture: %s\n", SDL_GetError());
         return -1;
     }
 
-    // create a duplicate of the mario surface with the same pixel format as the window
-    SDL_Surface *newMarioSurface = SDL_ConvertSurfaceFormat(marioSurface, SDL_GetWindowPixelFormat(window), 0);
+    // initialize player position/texture coordinate information
+    SDL_Rect playerSrcRect = { 0, 0, 16, 16 };
+    SDL_Rect playerDstRect = { 0, 0, 64, 64 };
+    float playerX = 0.0f;
+    float playerY = 0.0f;
 
-    // no longer need to hang on to the original image
-    SDL_FreeSurface(marioSurface);
+    typedef enum PlayerDirection
+    {
+        PLAYER_DIRECTION_UP,
+        PLAYER_DIRECTION_LEFT,
+        PLAYER_DIRECTION_RIGHT,
+        PLAYER_DIRECTION_DOWN
+    } PlayerDirection;
 
-    // set (255,0,255) as the transparent color
-    if (SDL_SetColorKey(newMarioSurface, SDL_TRUE, SDL_MapRGB(newMarioSurface->format, 255, 0, 255))) {
-        printf("SDL_SetColorKey: %s\n", SDL_GetError());
-        return -1;
-    }
+    typedef enum PlayerState
+    {
+        PLAYER_STATE_IDLE,
+        PLAYER_STATE_WALKING
+    } PlayerState;
 
-    // create a renderable texture from the image
-    SDL_Texture *marioTexture = SDL_CreateTextureFromSurface(renderer, newMarioSurface);
-    if (!marioTexture) {
-        printf("SDL_CreateTextureFromSurface: %s\n", SDL_GetError());
-        return -1;
-    }
-
-    // no longer need to hang on to the converted image
-    SDL_FreeSurface(newMarioSurface);
-
-    typedef enum MarioState {
-        MARIO_JUMPING,
-        MARIO_WALKING,
-        MARIO_IDLE
-    } MarioState;
-
-    // current state of mario
-    MarioState marioState = MARIO_IDLE;
-
-    // position of mario in the world
-    float marioXPosition = 200;
-    float marioYPosition = 200;
-    float marioMovementSpeed = 50; // pixels per second
-    
-    // stores whether or not the mario state should be flipped
-    SDL_RendererFlip marioFlipping = SDL_FLIP_NONE;
-
-    // will use the time between state switches to know what frame of animation to use
+    PlayerDirection playerDirection = PLAYER_DIRECTION_DOWN;
+    PlayerState playerState = PLAYER_STATE_IDLE;
     Uint32 timeOfLastStateSwitch = SDL_GetTicks();
 
     Uint32 timeOfLastFrame = SDL_GetTicks();
@@ -96,100 +80,130 @@ int main(int argc, char *argv[])
             // if the window is being requested to close, then stop the game.
             if (e.type == SDL_QUIT) {
                 isGameRunning = 0;
+            } else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
+                // get the event handling function to call
+                if (e.type == SDL_KEYDOWN) {
+                    lua_getglobal(L, "OnKeyPressed");
+                } else {
+                    lua_getglobal(L, "OnKeyReleased");
+                }
+
+                // if it's of function type, then call it passing the key name
+                if (lua_type(L, -1) == LUA_TFUNCTION) {
+                    lua_pushstring(L, SDL_GetKeyName(e.key.keysym.sym));
+                    if (lua_pcall(L, 1, 0, 0)) {
+                        printf("OnKeyPressed error: %s\n", lua_tostring(L, -1));
+                        lua_pop(L, 1);
+                    }
+                }
+                else
+                {
+                    lua_pop(L, 1);
+                }
             }
         }
 
-        // store the old state to know if the state has changed
-        MarioState oldMarioState = marioState;
-
-        // get a lookup table to know if keys are pressed
-        const Uint8 *keyboardState = SDL_GetKeyboardState(NULL);
-
-        // handle left movement key
-        if (keyboardState[SDL_SCANCODE_LEFT]) {
-            marioXPosition -= marioMovementSpeed * (frameDeltaTime / 1000.0f);
-            marioFlipping = SDL_FLIP_NONE;
-            
-            // switch to walking state
-            marioState = MARIO_WALKING;
+        // call Update on the Lua side
+        lua_getglobal(L, "Update");
+        lua_pushnumber(L, frameDeltaTime);
+        if (lua_pcall(L, 1, 0, 0)) {
+            printf("Update error: %s\n", lua_tostring(L, -1));
+            lua_pop(L, 1);
         }
+
+        // Read player position
+        lua_getglobal(L, "gPlayerPosition");
+        if (lua_type(L, -1) == LUA_TTABLE)
+        {
+            lua_getfield(L, -1, "x");
+            lua_getfield(L, -2, "y");
+            playerX = luaL_checknumber(L, -2);
+            playerY = luaL_checknumber(L, -1);
+            lua_pop(L, 2);
+        }
+        lua_pop(L, 1);
+
+        // Read player direction
+        lua_getglobal(L, "gPlayerDirection");
+        if (lua_type(L, -1) == LUA_TSTRING)
+        {
+            const char *direction = lua_tostring(L, -1);
+            if (strcmp(direction, "up") == 0) {
+                playerDirection = PLAYER_DIRECTION_UP;
+            } else if (strcmp(direction, "down") == 0) {
+                playerDirection = PLAYER_DIRECTION_DOWN;
+            } else if (strcmp(direction, "left") == 0) {
+                playerDirection = PLAYER_DIRECTION_LEFT;
+            } else if (strcmp(direction, "right") == 0) {
+                playerDirection = PLAYER_DIRECTION_RIGHT;
+            } else {
+                printf("Unknown direction: %s\n", direction);
+            }
+        }
+        lua_pop(L, 1);
+
+        // Read player state
+        lua_getglobal(L, "gPlayerState");
+        if (lua_type(L, -1) == LUA_TSTRING)
+        {
+            const char *state = lua_tostring(L, -1);
+            PlayerState newState;
+            int wasValidState = 1;
+            if (strcmp(state, "idle") == 0) {
+                newState = PLAYER_STATE_IDLE;
+            } else if (strcmp(state, "walking") == 0) {
+                newState = PLAYER_STATE_WALKING;
+            } else {
+                printf("Unknown state: %s\n", state);
+                wasValidState = 0;
+            }
+            if (wasValidState) {
+                if (playerState != newState) {
+                    timeOfLastStateSwitch = SDL_GetTicks();
+                }
+                playerState = newState;
+            }
+        }
+        lua_pop(L, 1);
+
+        // adjust animation to position
+        playerDstRect.x = playerX;
+        playerDstRect.y = playerY;
+
+        // adjust animation to direction
+        playerSrcRect.y = playerDirection * 16;
         
-        // handle right movement key
-        if (keyboardState[SDL_SCANCODE_RIGHT]) {
-            marioXPosition += marioMovementSpeed * (frameDeltaTime / 1000.0f);
-            marioFlipping = SDL_FLIP_HORIZONTAL;
-            
-            // switch to walking state
-            marioState = MARIO_WALKING;
+        // adjust animation to state and time
+        if (playerState == PLAYER_STATE_WALKING)
+        {
+            int frameDuration = 1000/6; // animation at 6fps
+            int framesSinceStateSwitch = (SDL_GetTicks() - timeOfLastStateSwitch) / frameDuration;
+            // base animation on odd/even frames.
+            if (framesSinceStateSwitch & 1) {
+                playerSrcRect.x = 0;
+            } else {
+                playerSrcRect.x = 16;
+            }
         }
 
-        // if nothing's being pressed, then we're in the idle state
-        if (!keyboardState[SDL_SCANCODE_LEFT] && !keyboardState[SDL_SCANCODE_RIGHT]) {
-            marioState = MARIO_IDLE;
-        }
-
-        // update the time of the last state switch
-        if (marioState != oldMarioState) {
-            timeOfLastStateSwitch = SDL_GetTicks();
-        }
-
-        // render everything
-        if (SDL_RenderClear(renderer)) {
+        // clear the screen
+        if (SDL_RenderClear(gRenderer)) {
             printf("SDL_RenderClear: %s\n", SDL_GetError());
             return -1;
         }
-
-        // decide frame of animation to use
-        int currentSpriteFrame;
-        if (marioState == MARIO_IDLE) {
-            currentSpriteFrame = 2;
-        } else if (marioState == MARIO_WALKING) {
-            // get the index of the frame we're currently at (12 fps animation speed)
-            Uint32 millisecondsPerFrame = 1000/12;
-            Uint32 framesPassedSinceStateSwitch = (SDL_GetTicks() - timeOfLastStateSwitch) / millisecondsPerFrame;
-            // if we're on an odd frame, use the standing animation.
-            // if we're on an even frame, use the walking animation.
-            if (framesPassedSinceStateSwitch & 1) {
-                currentSpriteFrame = 2;
-            } else {
-                currentSpriteFrame = 1;
-            }
-        } else {
-            currentSpriteFrame = 0;
-        }
-
-        // set up the rendering for mario
-        // note: each frame in the animation has size 16x32 in the sprite sheet
         
-        // the source rectangle defines which region of the sprite sheet to use
-        SDL_Rect renderSourceRect; 
-        renderSourceRect.x = currentSpriteFrame * 16;
-        renderSourceRect.y = 0;
-        renderSourceRect.w = 16;
-        renderSourceRect.h = 32;
-
-        // the destination rectangle defines which region of the screen to draw it to
-        SDL_Rect renderDestinationRect;
-        renderDestinationRect.x = marioXPosition;
-        renderDestinationRect.y = marioYPosition - 32 * 2; // sprite is scaled 2x
-        renderDestinationRect.w = 16 * 2; // sprite is scaled 2x
-        renderDestinationRect.h = 32 * 2; // sprite is scaled 2x
-
         // finally, do the real rendering
-        if (SDL_RenderCopyEx(
-                renderer,
-                marioTexture,
-                &renderSourceRect,
-                &renderDestinationRect,
-                0.0, // no rotation
-                NULL, // no center of rotation
-                marioFlipping)) {
+        if (SDL_RenderCopy(
+                gRenderer,
+                playerTexture,
+                &playerSrcRect,
+                &playerDstRect)) {
             printf("SDL_RenderCopy: %s\n", SDL_GetError());
             return -1;
         }
 
         // flip the display
-        SDL_RenderPresent(renderer);
+        SDL_RenderPresent(gRenderer);
 
         // throttle the frame rate to 60fps
         SDL_Delay(1000/60);
@@ -199,4 +213,37 @@ int main(int argc, char *argv[])
     SDL_Quit();
 
     return 0;
+}
+
+// Routine for loading color keyed textures and doing all the stupid stuff that comes with it
+SDL_Texture * LoadTexture(const char *spriteSheetPath)
+{
+    // load the image
+    SDL_Surface *surface = SDL_LoadBMP(spriteSheetPath);
+    if (!surface) {
+        return NULL;
+    }
+
+    // create a duplicate of the surface with the same pixel format as the window
+    SDL_Surface *newSurface = SDL_ConvertSurfaceFormat(surface, SDL_GetWindowPixelFormat(gWindow), 0);
+
+    // no longer need to hang on to the original image
+    SDL_FreeSurface(surface);
+
+    if (!newSurface) {
+        return NULL;
+    }
+
+    // set (255,0,255) as the transparent color
+    if (SDL_SetColorKey(newSurface, SDL_TRUE, SDL_MapRGB(newSurface->format, 255, 0, 255))) {
+        return NULL;
+    }
+
+    // create a renderable texture from the image
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(gRenderer, newSurface);
+
+    // no longer need to hang on to the converted image
+    SDL_FreeSurface(newSurface);
+
+    return texture;
 }
